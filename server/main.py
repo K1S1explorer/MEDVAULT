@@ -4,7 +4,7 @@ Central API serving all four role-based interfaces.
 India-centric medical identity ecosystem.
 """
 
-from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Request
+from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Request, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
@@ -18,11 +18,13 @@ from models import (
 )
 from auth import (
     generate_medical_id, hash_password, verify_password,
-    create_access_token, get_current_user, require_role
+    create_access_token, get_current_user, require_role, decode_token
 )
 from ai_engine import summarize_report, generate_voice_summary
 from ocr_processor import process_upload, save_uploaded_file
 from rag_voice import build_rag_context, query_gemini
+from bhashini_api import bhashini_asr, bhashini_tts
+from gemini_live import bridge_gemini_live
 
 # ─── App Init ────────────────────────────────────────────────────────────────
 
@@ -120,6 +122,11 @@ class VoiceQueryRequest(BaseModel):
 
 class RAGChatRequest(BaseModel):
     query: str
+    language: str = "en"
+
+
+class BhashiniVoiceRequest(BaseModel):
+    audio_base64: str
     language: str = "en"
 
 
@@ -531,6 +538,141 @@ def rag_voice_chat(
         "language": req.language,
         "rag_source": f"{len(records_data)} medical records used as context",
     }
+
+
+@app.post("/api/voice/bhashini-chat", tags=["Voice AI"])
+def bhashini_voice_chat(
+    req: BhashiniVoiceRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Bhashini API pipeline:
+    1. ASR + Transcribe regional audio to English text.
+    2. Query GEMINI RAG with patient medical context using the English text.
+    3. Translate Answer to regional language & convert to Speech (TTS) via Bhashini.
+    """
+    
+    # Step 1: Decode Audio into English Text (Bhashini ASR -> Translate to Eng)
+    english_query = bhashini_asr(req.audio_base64, req.language)
+    
+    if not english_query:
+        english_query = "Please tell me my health status." # Fallback
+
+    # Step 2: Retrieve RAG Context
+    patient_data = {
+        "full_name": current_user.full_name,
+        "date_of_birth": current_user.date_of_birth,
+        "gender": current_user.gender,
+        "blood_group": current_user.blood_group,
+        "allergies": current_user.allergies,
+        "chronic_conditions": current_user.chronic_conditions,
+        "current_medications": current_user.current_medications,
+    }
+
+    records = db.query(MedicalRecord).filter(
+        MedicalRecord.patient_id == current_user.id
+    ).order_by(MedicalRecord.created_at.desc()).all()
+
+    records_data = []
+    for r in records[:10]:
+        records_data.append({
+            "title": r.title,
+            "record_type": r.record_type.value if r.record_type else None,
+            "ai_summary": r.ai_summary,
+            "alert_level": r.alert_level.value if r.alert_level else "normal",
+        })
+
+    rag_context = build_rag_context(patient_data, records_data)
+
+    # Step 3: Run the Query through Gemini (Returns string)
+    answer_en = query_gemini(english_query, rag_context, "en") # Always answer in English first for Bhashini pipeline
+
+    # Step 4: Convert English Answer -> Regional Audio using Bhashini TTS
+    audio_response_base64 = bhashini_tts(answer_en, req.language)
+
+    # Step 5: Log the session (recording the English translated flow for consistency)
+    session = VoiceSession(
+        patient_id=current_user.id,
+        language=req.language,
+        query=english_query,
+        response=answer_en,
+    )
+    db.add(session)
+    db.commit()
+
+    return {
+        "answer": answer_en, # We can also display the english/translated text on UI if needed
+        "audio_base64": audio_response_base64,
+        "language": req.language
+    }
+
+
+@app.websocket("/api/voice/live")
+async def websocket_gemini_live(
+    websocket: WebSocket,
+    token: str = Query(None),
+    db: Session = Depends(get_db)
+):
+    """
+    WebSocket endpoint for connecting the React frontend directly to 
+    the Gemini Multimodal Live API using raw PCM audio.
+    """
+    if not token:
+        await websocket.close(code=1008)
+        return
+        
+    try:
+        # Authenticate via query param token
+        payload = decode_token(token)
+        medical_id = payload.get("sub")
+        user = db.query(User).filter(User.medical_id == medical_id).first()
+        if not user:
+            await websocket.close(code=1008)
+            return
+
+        # Build Context for Gemini Setup
+        patient_data = {
+            "full_name": user.full_name,
+            "date_of_birth": user.date_of_birth,
+            "gender": user.gender,
+            "blood_group": user.blood_group,
+            "allergies": user.allergies,
+            "chronic_conditions": user.chronic_conditions,
+            "current_medications": user.current_medications,
+        }
+
+        records = db.query(MedicalRecord).filter(
+            MedicalRecord.patient_id == user.id
+        ).order_by(MedicalRecord.created_at.desc()).all()
+
+        records_data = []
+        for r in records[:10]:
+            records_data.append({
+                "title": r.title,
+                "record_type": r.record_type.value if r.record_type else None,
+                "ai_summary": r.ai_summary,
+                "alert_level": r.alert_level.value if r.alert_level else "normal",
+            })
+
+        rag_context = build_rag_context(patient_data, records_data)
+        
+        system_instruction = (
+            f"You are MedVault AI. You are having a live voice call with {user.full_name}.\n"
+            f"Please keep your responses extremely short (1-2 sentences max), conversational, and do NOT prescribe medicines.\n"
+            f"Here is their medical record context:\n\n{rag_context}"
+        )
+
+        # Bridge the connection
+        await bridge_gemini_live(websocket, system_instruction)
+
+    except Exception as e:
+        print(f"WS Exception: {e}")
+        try:
+            await websocket.close()
+        except:
+            pass
+
 
 
 # ─── HEALTH CHECK ───────────────────────────────────────────────────────────
