@@ -37,6 +37,7 @@ cd server
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+pip install 'uvicorn[standard]'
 uvicorn main:app --reload --port 8000
 ```
 
@@ -90,17 +91,17 @@ After logging in as the **Patient**, scroll down to the **AI Health Chat** secti
 | `Do I have any allergies?` | "Allergies to: Penicillin, Sulfa drugs" |
 | `What medications am I on?` | "Metformin 500mg, Amlodipine 5mg" |
 | `Do I have diabetes?` | "You have diabetes on record..." |
-| `What about my BP?` | "You have hypertension on record..." |
 
-### Hindi (set language to हिंदी):
-| Question | Expected Response |
+### Multilingual Support (8 Languages auto-detected):
+| Language | Example Question |
 |----------|------------------|
-| `Mera blood group kya hai?` | "Aapka blood group B+ hai" |
-| `Mujhe kya allergy hai?` | "Aapko Penicillin, Sulfa drugs se allergy hai" |
-| `Meri dawaiyan kya hain?` | "Aapki current dawaiyan: Metformin 500mg..." |
+| **Hindi** | `Mera blood group kya hai?` |
+| **Punjabi**| `Meri dawai ki hai?` |
+| **Bengali**| `Amar allergy ki?` |
+| **Marathi**| `Majha raktagat kaay aahe?` |
 
-### Optional: Enable Gemini AI (Free)
-For smarter conversational answers (instead of keyword-based), get a free API key:
+### Optional: Enable Gemini AI (Free API Key)
+For smarter conversational RAG answers (instead of keyword-based fallbacks), get a free API key:
 1. Go to [aistudio.google.com/apikey](https://aistudio.google.com/apikey)
 2. Click "Create API Key" (free, no credit card)
 3. Set it before starting the backend:
@@ -152,12 +153,12 @@ uvicorn main:app --reload --port 8000
 - Supported markers: Glucose, HbA1c, Creatinine, Troponin, TSH, Hemoglobin, Platelets, Cholesterol
 
 ### 4. 🗣️ Speech-to-Speech RAG Voice AI
-- **Real-time speech recognition** via Web Speech API
-- **RAG-powered answers** using patient's medical records as context
+- **Real-time WebSockets**: Secure private connections for fast, low-latency conversational sessions
+- **RAG-powered answers**: Uses patient's medical records as context
 - **Auto-speaks responses** via browser SpeechSynthesis
-- Supports **Hindi, Tamil, and English**
+- **8 Supported Languages**: Auto-detects English, Hindi, Punjabi, Bengali, Tamil, Telugu, and Marathi.
 - Safety guardrails prevent prescriptive language
-- Works with **Gemini free tier** or intelligent keyword fallback
+- Works with **Gemini 2.0+ SDK** (`google-genai`) or intelligent keyword fallback
 
 ### 5. 🔒 Security & Privacy
 - **Aadhaar never stored** — only its SHA-256 hash (Universal Medical ID)
@@ -176,9 +177,10 @@ uvicorn main:app --reload --port 8000
 | Database | SQLite + SQLAlchemy | Zero-config, free DB |
 | Auth | JWT + bcrypt | Token-based security |
 | OCR | Tesseract (pytesseract) | Free text extraction |
-| RAG AI | Gemini 2.0 Flash (free tier) | Conversational health AI |
+| RAG AI | Gemini 2.0 Flash (`google-genai`) | Conversational health AI |
 | Voice STT | Web Speech API | Browser-native speech recognition |
 | Voice TTS | Web SpeechSynthesis | Browser-native text-to-speech |
+| Transport | WebSockets | Real-time chat streaming |
 | QR | qrserver.com API | Free QR generation |
 
 **Total cost: ₹0**
@@ -258,6 +260,7 @@ MEDVAULT/
 | Issue | Fix |
 |-------|-----|
 | `ECONNREFUSED` on frontend | Backend isn't running. Start it in Terminal 1 |
+| WebSocket 404/Disconnect | Ensure you ran `pip install 'uvicorn[standard]'` |
 | `bcrypt` / `passlib` error | We use `bcrypt` directly now. Run `pip install bcrypt` |
 | `npm: command not found` | Install Node.js from nodejs.org |
 | `python3: command not found` | Install Python from python.org |
