@@ -9,4 +9,6 @@ Pillow
 langchain
 langchain-huggingface
 langchain-community
-google-generativeai
+google-genai
+requests
+websockets

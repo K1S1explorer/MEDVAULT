@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'react';
-import { Mic, MicOff, Volume2, VolumeX, Send, Bot, User, Loader, Globe } from 'lucide-react';
-import { api, getToken } from '../lib/api';
+import { Mic, MicOff, Volume2, Bot, Loader, PhoneCall, PhoneOff } from 'lucide-react';
+import { getToken } from '../lib/api';
 
 interface ChatMessage {
   role: 'user' | 'ai';
@@ -8,373 +8,333 @@ interface ChatMessage {
   timestamp: Date;
 }
 
-// Extend Window for webkitSpeechRecognition
-interface SpeechRecognitionEvent {
-  results: { [key: number]: { [key: number]: { transcript: string } } };
-}
-
 export default function VoiceChatRAG() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [inputText, setInputText] = useState('');
-  const [isListening, setIsListening] = useState(false);
-  const [isSpeaking, setIsSpeaking] = useState(false);
-  const [isLoading, setIsLoading] = useState(false);
-  const [language, setLanguage] = useState('en');
-  const [autoSpeak, setAutoSpeak] = useState(true);
-  const [interimText, setInterimText] = useState('');
+  const [isLiveConnected, setIsLiveConnected] = useState(false);
+  const [isAiSpeaking, setIsAiSpeaking] = useState(false);
+  const [errorStatus, setErrorStatus] = useState<string | null>(null);
+
+  const wsRef = useRef<WebSocket | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  
+  // To queue AI's audio sequentially without overlapping
+  const nextPlayTimeRef = useRef<number>(0);
+
   const chatEndRef = useRef<HTMLDivElement>(null);
-  const recognitionRef = useRef<any>(null);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  // Initialize Speech Recognition
-  const startListening = () => {
-    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (!SpeechRecognition) {
-      alert('Speech recognition not supported. Use Chrome or Edge.');
-      return;
-    }
-
-    const recognition = new SpeechRecognition();
-    recognition.continuous = false;
-    recognition.interimResults = true;
-    recognition.lang = language === 'hi' ? 'hi-IN' : language === 'ta' ? 'ta-IN' : 'en-IN';
-
-    recognition.onresult = (event: SpeechRecognitionEvent) => {
-      let transcript = '';
-      for (let i = 0; i < Object.keys(event.results).length; i++) {
-        transcript += event.results[i][0].transcript;
-      }
-      setInterimText(transcript);
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      stopLiveCall();
     };
+  }, []);
 
-    recognition.onend = () => {
-      setIsListening(false);
-      if (interimText.trim()) {
-        setInputText(interimText.trim());
-        // Auto-send after speech ends
-        handleSend(interimText.trim());
-      }
-      setInterimText('');
-    };
-
-    recognition.onerror = () => {
-      setIsListening(false);
-      setInterimText('');
-    };
-
-    recognitionRef.current = recognition;
-    recognition.start();
-    setIsListening(true);
-  };
-
-  const stopListening = () => {
-    if (recognitionRef.current) {
-      recognitionRef.current.stop();
-    }
-    setIsListening(false);
-  };
-
-  // Text-to-Speech
-  const speak = (text: string) => {
-    if (!('speechSynthesis' in window)) return;
-
-    // Cancel any ongoing speech
-    speechSynthesis.cancel();
-
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.lang = language === 'hi' ? 'hi-IN' : language === 'ta' ? 'ta-IN' : 'en-IN';
-    utterance.rate = 0.9;
-    utterance.pitch = 1;
-
-    utterance.onstart = () => setIsSpeaking(true);
-    utterance.onend = () => setIsSpeaking(false);
-    utterance.onerror = () => setIsSpeaking(false);
-
-    speechSynthesis.speak(utterance);
-  };
-
-  const stopSpeaking = () => {
-    speechSynthesis.cancel();
-    setIsSpeaking(false);
-  };
-
-  // Send message to RAG backend
-  const handleSend = async (text?: string) => {
-    const query = text || inputText.trim();
-    if (!query || isLoading) return;
-
-    const userMsg: ChatMessage = { role: 'user', text: query, timestamp: new Date() };
-    setMessages(prev => [...prev, userMsg]);
-    setInputText('');
-    setIsLoading(true);
-
+  const startLiveCall = async () => {
     try {
-      const data = await api<{ answer: string; rag_source: string }>('/voice/chat', {
-        method: 'POST',
-        token: getToken()!,
-        body: { query, language },
-      });
+      setErrorStatus(null);
+      // Construct WebSocket URL
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      // In Vite dev, window.location.host is frontend. Rely on API URL usually localhost:8000
+      const baseUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+      const wsUrl = baseUrl.replace('http', 'ws') + `/api/voice/live?token=${getToken()}`;
+      
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
 
-      const aiMsg: ChatMessage = { role: 'ai', text: data.answer, timestamp: new Date() };
-      setMessages(prev => [...prev, aiMsg]);
-
-      // Auto-speak the response
-      if (autoSpeak) {
-        speak(data.answer);
-      }
-    } catch (err: unknown) {
-      const errMsg: ChatMessage = {
-        role: 'ai',
-        text: err instanceof Error ? err.message : 'Something went wrong. Please try again.',
-        timestamp: new Date(),
+      ws.onopen = async () => {
+        setIsLiveConnected(true);
+        // Start Microphone
+        await startMicCapture();
       };
-      setMessages(prev => [...prev, errMsg]);
-    } finally {
-      setIsLoading(false);
+
+      ws.onmessage = async (event) => {
+        if (event.data instanceof Blob) {
+          // Received Raw PCM Audio from Gemini (24kHz, 16-bit Int)
+          const arrayBuffer = await event.data.arrayBuffer();
+          playAudioPCM(arrayBuffer);
+        } else if (typeof event.data === 'string') {
+          try {
+            const msg = JSON.parse(event.data);
+            if (msg.type === 'text') {
+              // Add Gemini's text transcript to the chat log
+              setMessages(prev => {
+                // If the last message was also AI, append to it for a continuous stream feel,
+                // Or simply add a new message block. We'll add new for simplicity.
+                const last = prev[prev.length - 1];
+                if (last && last.role === 'ai') {
+                    const newBlock = [...prev];
+                    newBlock[newBlock.length - 1] = { ...last, text: last.text + msg.text };
+                    return newBlock;
+                }
+                return [...prev, { role: 'ai', text: msg.text, timestamp: new Date() }];
+              });
+            } else if (msg.error) {
+              setErrorStatus(msg.error);
+            }
+          } catch (e) {
+            console.error("Failed to parse WS msg", e);
+          }
+        }
+      };
+
+      ws.onclose = () => {
+        setIsLiveConnected(false);
+        stopMicCapture();
+      };
+
+      ws.onerror = () => {
+        setErrorStatus("WebSocket connection failed.");
+        stopLiveCall();
+      };
+
+    } catch (err: any) {
+      setErrorStatus(err.message || 'Failed to start live call');
+      console.error(err);
     }
   };
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      handleSend();
+  const stopLiveCall = () => {
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
     }
+    stopMicCapture();
+    setIsLiveConnected(false);
+    setIsAiSpeaking(false);
+  };
+
+  const startMicCapture = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        } 
+      });
+      streamRef.current = stream;
+
+      // Ensure 16kHz for Gemini Multimodal Live API
+      const AudioContext = window.AudioContext || (window as any).webkitAudioContext;
+      const audioCtx = new AudioContext({ sampleRate: 16000 });
+      audioContextRef.current = audioCtx;
+
+      const source = audioCtx.createMediaStreamSource(stream);
+
+      // We use ScriptProcessor for wide compatibility capturing raw float buffers.
+      const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+      processorRef.current = processor;
+
+      processor.onaudioprocess = (e) => {
+        const inputData = e.inputBuffer.getChannelData(0);
+        
+        // Convert Float32 to Int16 Little-Endian
+        const pcm16 = new Int16Array(inputData.length);
+        for (let i = 0; i < inputData.length; i++) {
+            const s = Math.max(-1, Math.min(1, inputData[i]));
+            pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        }
+
+        // Send binary buffer to WebSocket
+        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+          wsRef.current.send(pcm16.buffer);
+        }
+      };
+
+      // Create a dummy destination so the script processor actually fires
+      const gainNode = audioCtx.createGain();
+      gainNode.gain.value = 0; 
+
+      source.connect(processor);
+      processor.connect(gainNode);
+      gainNode.connect(audioCtx.destination);
+      
+      // Reset play queue timeline
+      nextPlayTimeRef.current = audioCtx.currentTime;
+
+    } catch (e) {
+      console.error("Mic Access Error:", e);
+      setErrorStatus("Microphone access blocked.");
+      stopLiveCall();
+    }
+  };
+
+  const stopMicCapture = () => {
+    if (processorRef.current) processorRef.current.disconnect();
+    if (streamRef.current) streamRef.current.getTracks().forEach(t => t.stop());
+    if (audioContextRef.current) audioContextRef.current.close();
+    processorRef.current = null;
+    streamRef.current = null;
+    audioContextRef.current = null;
+  };
+
+  const playAudioPCM = (arrayBuffer: ArrayBuffer) => {
+    if (!audioContextRef.current) return;
+    const ctx = audioContextRef.current;
+
+    // Gemini outputs 24kHz Int16 Little-Endian
+    const int16 = new Int16Array(arrayBuffer);
+    const float32 = new Float32Array(int16.length);
+    for (let i = 0; i < int16.length; i++) {
+        float32[i] = int16[i] / (int16[i] < 0 ? 0x8000 : 0x7FFF);
+    }
+
+    const audioBuffer = ctx.createBuffer(1, float32.length, 24000);
+    audioBuffer.getChannelData(0).set(float32);
+
+    const source = ctx.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(ctx.destination);
+
+    // Sequence playback handling network jitter
+    const currentTime = ctx.currentTime;
+    if (nextPlayTimeRef.current < currentTime) {
+        nextPlayTimeRef.current = currentTime; // Reset if we lagged behind
+    }
+    
+    source.onended = () => {
+      // If time reaches threshold, turn off speaking light
+      if (ctx.currentTime >= nextPlayTimeRef.current - 0.1) setIsAiSpeaking(false);
+    };
+
+    source.start(nextPlayTimeRef.current);
+    setIsAiSpeaking(true);
+    
+    nextPlayTimeRef.current += audioBuffer.duration;
   };
 
   return (
-    <div className="glass-card" style={{ padding: '0', overflow: 'hidden', display: 'flex', flexDirection: 'column', height: '600px' }}>
+    <div className="glass-card" style={{ padding: '0', overflow: 'hidden', display: 'flex', flexDirection: 'column', minHeight: '500px', maxHeight: '85vh' }}>
+      
       {/* Header */}
       <div style={{
         padding: '1rem 1.5rem', borderBottom: '1px solid var(--color-border)',
         display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-        background: 'rgba(15,23,42,0.5)',
+        background: 'rgba(15,23,42,0.6)', backdropFilter: 'blur(10px)',
+        flexShrink: 0
       }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
           <div style={{
             width: '2.5rem', height: '2.5rem', borderRadius: '0.75rem',
             background: 'linear-gradient(135deg, var(--color-primary), var(--color-primary-light))',
             display: 'flex', alignItems: 'center', justifyContent: 'center',
+            boxShadow: isLiveConnected ? '0 0 15px rgba(20,184,166,0.5)' : 'none',
+            animation: isAiSpeaking ? 'pulse-primary 1s infinite' : 'none',
           }}>
             <Bot size={18} color="white" />
           </div>
           <div>
-            <h3 style={{ fontSize: '1rem', fontWeight: 700, margin: 0 }}>MedVault Voice AI</h3>
-            <p style={{ fontSize: '0.75rem', color: 'var(--color-text-secondary)', margin: 0 }}>
-              RAG-powered · Ask about your health records
+            <h3 style={{ fontSize: '1rem', fontWeight: 700, margin: 0 }}>Gemini Live AI</h3>
+            <p style={{ fontSize: '0.75rem', color: isLiveConnected ? '#10b981' : 'var(--color-text-secondary)', margin: 0, display: 'flex', alignItems: 'center', gap: '0.2rem' }}>
+              {isLiveConnected ? <><span style={{width:'6px', height:'6px', borderRadius:'50%', background:'#10b981'}}/> Live streaming connected</> : 'Ready to start live call'}
             </p>
           </div>
         </div>
-
-        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-          <Globe size={14} color="var(--color-text-secondary)" />
-          <select
-            value={language}
-            onChange={(e) => setLanguage(e.target.value)}
-            style={{
-              background: 'rgba(15,23,42,0.8)', border: '1px solid var(--color-border)',
-              borderRadius: '0.5rem', padding: '0.3rem 0.5rem', color: 'var(--color-text-primary)',
-              fontSize: '0.8rem', outline: 'none',
-            }}
-          >
-            <option value="en">English</option>
-            <option value="hi">हिंदी</option>
-            <option value="ta">தமிழ்</option>
-          </select>
-          <button
-            onClick={() => setAutoSpeak(!autoSpeak)}
-            title={autoSpeak ? 'Auto-speak ON' : 'Auto-speak OFF'}
-            style={{
-              background: autoSpeak ? 'rgba(20,184,166,0.2)' : 'transparent',
-              border: '1px solid var(--color-border)', borderRadius: '0.5rem',
-              padding: '0.35rem', cursor: 'pointer', display: 'flex',
-              color: autoSpeak ? 'var(--color-primary-light)' : 'var(--color-text-secondary)',
-            }}
-          >
-            {autoSpeak ? <Volume2 size={16} /> : <VolumeX size={16} />}
-          </button>
-        </div>
       </div>
 
-      {/* Chat Messages */}
-      <div style={{
-        flex: 1, overflowY: 'auto', padding: '1.25rem',
-        display: 'flex', flexDirection: 'column', gap: '1rem',
-      }}>
-        {messages.length === 0 && (
-          <div style={{ textAlign: 'center', padding: '3rem 1rem', color: 'var(--color-text-secondary)' }}>
-            <Bot size={40} style={{ marginBottom: '1rem', opacity: 0.3 }} />
-            <h4 style={{ fontSize: '1rem', fontWeight: 600, marginBottom: '0.5rem', color: 'var(--color-text-primary)' }}>
-              Voice Health Assistant
-            </h4>
-            <p style={{ fontSize: '0.85rem', lineHeight: 1.6, maxWidth: '400px', margin: '0 auto' }}>
-              Ask me anything about your health records in English or Hindi. I'll answer using your medical data.
-            </p>
-            <div style={{ marginTop: '1.25rem', display: 'flex', flexDirection: 'column', gap: '0.5rem', alignItems: 'center' }}>
-              {[
-                language === 'hi' ? 'Mera blood group kya hai?' : 'What is my blood group?',
-                language === 'hi' ? 'Mujhe kya allergy hai?' : 'Do I have any allergies?',
-                language === 'hi' ? 'Meri dawaiyan kya hain?' : 'What medications am I on?',
-              ].map((q, i) => (
-                <button
-                  key={i}
-                  onClick={() => handleSend(q)}
-                  style={{
-                    background: 'rgba(20,184,166,0.08)', border: '1px solid rgba(20,184,166,0.2)',
-                    borderRadius: '0.75rem', padding: '0.5rem 1rem', color: 'var(--color-primary-light)',
-                    cursor: 'pointer', fontSize: '0.85rem', transition: 'all 0.2s ease',
-                  }}
-                >
-                  {q}
-                </button>
-              ))}
-            </div>
-          </div>
-        )}
-
-        {messages.map((msg, i) => (
-          <div
-            key={i}
-            style={{
-              display: 'flex', gap: '0.75rem',
-              flexDirection: msg.role === 'user' ? 'row-reverse' : 'row',
-            }}
-          >
-            <div style={{
-              width: '2rem', height: '2rem', borderRadius: '50%', flexShrink: 0,
-              background: msg.role === 'user' ? 'rgba(59,130,246,0.2)' : 'rgba(20,184,166,0.2)',
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-            }}>
-              {msg.role === 'user' ? <User size={14} color="#60a5fa" /> : <Bot size={14} color="#14b8a6" />}
-            </div>
-            <div style={{
-              maxWidth: '75%', padding: '0.85rem 1.1rem', borderRadius: '1rem',
-              background: msg.role === 'user'
-                ? 'linear-gradient(135deg, rgba(59,130,246,0.15), rgba(59,130,246,0.08))'
-                : 'rgba(15,23,42,0.8)',
-              border: `1px solid ${msg.role === 'user' ? 'rgba(59,130,246,0.2)' : 'var(--color-border)'}`,
-              fontSize: '0.9rem', lineHeight: 1.65,
-            }}>
-              {msg.text}
-              {msg.role === 'ai' && (
-                <button
-                  onClick={() => speak(msg.text)}
-                  style={{
-                    display: 'inline-flex', alignItems: 'center', gap: '0.3rem',
-                    background: 'none', border: 'none', color: 'var(--color-primary-light)',
-                    cursor: 'pointer', fontSize: '0.75rem', marginLeft: '0.5rem', opacity: 0.7,
-                  }}
-                >
-                  <Volume2 size={12} /> Play
-                </button>
-              )}
-            </div>
-          </div>
-        ))}
-
-        {isLoading && (
-          <div style={{ display: 'flex', gap: '0.75rem' }}>
-            <div style={{
-              width: '2rem', height: '2rem', borderRadius: '50%', flexShrink: 0,
-              background: 'rgba(20,184,166,0.2)',
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-            }}>
-              <Bot size={14} color="#14b8a6" />
-            </div>
-            <div style={{
-              padding: '0.85rem 1.1rem', borderRadius: '1rem',
-              background: 'rgba(15,23,42,0.8)', border: '1px solid var(--color-border)',
-              fontSize: '0.9rem', color: 'var(--color-text-secondary)',
-              display: 'flex', alignItems: 'center', gap: '0.5rem',
-            }}>
-              <Loader size={14} style={{ animation: 'spin 1s linear infinite' }} />
-              Analyzing your records...
-            </div>
-          </div>
-        )}
-
-        <div ref={chatEndRef} />
-      </div>
-
-      {/* Interim transcript */}
-      {isListening && interimText && (
-        <div style={{
-          padding: '0.5rem 1.5rem', background: 'rgba(59,130,246,0.05)',
-          borderTop: '1px solid rgba(59,130,246,0.1)', fontSize: '0.85rem',
-          color: 'var(--color-text-secondary)', fontStyle: 'italic',
-        }}>
-          🎤 {interimText}
+      {/* Connection Error Banner */}
+      {errorStatus && (
+        <div style={{ padding: '0.75rem', background: 'rgba(239, 68, 68, 0.2)', color: '#f87171', fontSize: '0.85rem', textAlign: 'center', borderBottom: '1px solid rgba(239, 68, 68, 0.4)', flexShrink: 0 }}>
+          ⚠️ {errorStatus}
         </div>
       )}
 
-      {/* Input Area */}
+      {/* Main Chat Interface vs Active Call */}
       <div style={{
-        padding: '1rem 1.25rem', borderTop: '1px solid var(--color-border)',
-        display: 'flex', alignItems: 'center', gap: '0.75rem',
-        background: 'rgba(15,23,42,0.5)',
+        flex: 1, padding: '1rem', display: 'flex', flexDirection: 'column', 
+        alignItems: 'center', justifyContent: 'center', gap: '1.25rem',
+        background: 'radial-gradient(circle at center, rgba(30,41,59,0.3) 0%, rgba(15,23,42,0) 100%)',
+        overflowY: 'auto'
       }}>
-        {/* Mic Button */}
+        
+        {/* Pulsing Visualizer / Call Status */}
+        <div style={{
+          width: '100px', height: '100px', borderRadius: '50%',
+          background: isLiveConnected ? 'rgba(20, 184, 166, 0.1)' : 'rgba(148, 163, 184, 0.05)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          position: 'relative',
+        }}>
+          {isLiveConnected && (
+            <>
+              <div style={{ position:'absolute', width:'100%', height:'100%', borderRadius:'50%', border:'2px solid rgba(20, 184, 166, 0.5)', animation: 'ping 2s cubic-bezier(0, 0, 0.2, 1) infinite' }} />
+              {isAiSpeaking && <div style={{ position:'absolute', width:'120%', height:'120%', borderRadius:'50%', border:'2px solid rgba(59, 130, 246, 0.3)', animation: 'ping 1.5s cubic-bezier(0, 0, 0.2, 1) infinite' }} />}
+            </>
+          )}
+          <Bot size={40} color={isLiveConnected ? (isAiSpeaking ? '#60a5fa' : '#14b8a6') : '#475569'} style={{ transition: 'all 0.3s ease' }} />
+        </div>
+
+        <div style={{ textAlign: 'center' }}>
+          <h2 style={{ margin: '0 0 0.5rem 0', color: 'var(--color-heading)', fontSize: '1.2rem' }}>
+            {isLiveConnected 
+              ? (isAiSpeaking ? "Gemini is speaking..." : "Listening...") 
+              : "Live Voice Assistant"}
+          </h2>
+          <p style={{ margin: 0, color: 'var(--color-text-secondary)', fontSize: '0.85rem', maxWidth: '300px', lineHeight: 1.5 }}>
+            {isLiveConnected 
+              ? "Speak directly into your microphone. Gemini will seamlessly interpret your voice and medical records in real-time." 
+              : "Hit the button below to establish a real-time, bidirectional voice call powered by Gemini."}
+          </p>
+        </div>
+
+        {/* Start / End Call Button */}
         <button
-          onClick={isListening ? stopListening : startListening}
+          onClick={isLiveConnected ? stopLiveCall : startLiveCall}
           style={{
-            width: '2.75rem', height: '2.75rem', borderRadius: '50%', flexShrink: 0,
-            background: isListening
-              ? 'linear-gradient(135deg, #dc2626, #ef4444)'
+            padding: '0.85rem 1.5rem', borderRadius: '2rem', border: 'none',
+            background: isLiveConnected 
+              ? 'linear-gradient(135deg, #ef4444, #dc2626)' 
               : 'linear-gradient(135deg, var(--color-primary), var(--color-primary-light))',
-            border: 'none', cursor: 'pointer', display: 'flex',
-            alignItems: 'center', justifyContent: 'center',
-            boxShadow: isListening ? '0 0 20px rgba(239,68,68,0.4)' : '0 0 20px rgba(20,184,166,0.2)',
-            transition: 'all 0.2s ease',
-            animation: isListening ? 'pulse-red 1.5s infinite' : 'none',
+            color: 'white', fontWeight: 600, fontSize: '0.9rem',
+            display: 'flex', alignItems: 'center', gap: '0.5rem',
+            cursor: 'pointer', transition: 'all 0.2s',
+            boxShadow: isLiveConnected ? '0 8px 25px rgba(239, 68, 68, 0.3)' : '0 8px 25px rgba(20, 184, 166, 0.3)',
+            marginTop: '0.5rem', marginBottom: '0.5rem'
           }}
         >
-          {isListening ? <MicOff size={18} color="white" /> : <Mic size={18} color="white" />}
+          {isLiveConnected ? <PhoneOff size={18} /> : <PhoneCall size={18} />}
+          {isLiveConnected ? 'End Live Call' : 'Start Live Call'}
         </button>
 
-        {/* Text Input */}
-        <input
-          className="input-field"
-          placeholder={isListening ? 'Listening...' : language === 'hi' ? 'Apna sawaal poochein...' : 'Ask about your health...'}
-          value={inputText}
-          onChange={(e) => setInputText(e.target.value)}
-          onKeyDown={handleKeyDown}
-          disabled={isListening}
-          style={{ flex: 1 }}
-        />
-
-        {/* Send Button */}
-        <button
-          onClick={() => handleSend()}
-          disabled={!inputText.trim() || isLoading}
-          style={{
-            width: '2.75rem', height: '2.75rem', borderRadius: '50%', flexShrink: 0,
-            background: inputText.trim() ? 'var(--color-primary)' : 'var(--color-border)',
-            border: 'none', cursor: inputText.trim() ? 'pointer' : 'default',
-            display: 'flex', alignItems: 'center', justifyContent: 'center',
-            transition: 'all 0.2s ease',
-          }}
-        >
-          <Send size={16} color="white" />
-        </button>
-
-        {/* Stop speaking */}
-        {isSpeaking && (
-          <button
-            onClick={stopSpeaking}
-            style={{
-              width: '2.75rem', height: '2.75rem', borderRadius: '50%', flexShrink: 0,
-              background: 'rgba(239,68,68,0.2)', border: '1px solid rgba(239,68,68,0.3)',
-              cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
-            }}
-          >
-            <VolumeX size={16} color="#f87171" />
-          </button>
-        )}
       </div>
 
-      <style>{`@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`}</style>
+      {/* Transcript Log (Optional - just to show AI text if received) */}
+      {messages.length > 0 && (
+        <div style={{
+          maxHeight: '120px', borderTop: '1px solid var(--color-border)',
+          background: 'rgba(15,23,42,0.8)', padding: '0.75rem', overflowY: 'auto',
+          display: 'flex', flexDirection: 'column', gap: '0.5rem',
+          flexShrink: 0
+        }}>
+          <div style={{ fontSize: '0.7rem', textTransform: 'uppercase', color: 'var(--color-text-secondary)', letterSpacing: '1px', marginBottom: '0.5rem' }}>
+            Live Transcript
+          </div>
+          {messages.map((m, i) => (
+            <div key={i} style={{ fontSize: '0.85rem', color: m.role === 'ai' ? '#e2e8f0' : '#94a3b8', lineHeight: 1.5 }}>
+              <strong style={{ color: m.role === 'ai' ? '#14b8a6' : '#64748b' }}>{m.role === 'ai' ? 'Gemini: ' : 'You: '}</strong>
+              {m.text}
+            </div>
+          ))}
+          <div ref={chatEndRef} />
+        </div>
+      )}
+
+      {/* Minimal CSS Animations */}
+      <style>{`
+        @keyframes ping {
+          75%, 100% { transform: scale(1.5); opacity: 0; }
+        }
+        @keyframes pulse-primary {
+          0%, 100% { opacity: 1; transform: scale(1); }
+          50% { opacity: 0.8; transform: scale(1.05); }
+        }
+      `}</style>
+
     </div>
   );
 }
